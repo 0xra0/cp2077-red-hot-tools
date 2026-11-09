@@ -3,6 +3,7 @@
 /.vscode
 /.xmake
 /build
+/dist
 /dev
 /src/App/Staging
 /src/App/Project.hpp

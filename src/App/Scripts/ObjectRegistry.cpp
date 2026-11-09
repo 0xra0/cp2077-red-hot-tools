@@ -5,6 +5,10 @@ namespace
 {
 constexpr auto MaxNumObjects = 0x350000;
 
+// Shrink when the registry reaches this size. It grows when most objects are still alive,
+// otherwise every new handle would rescan millions of entries under the exclusive lock.
+size_t s_shrinkThreshold = MaxNumObjects - 1;
+
 Red::ClassLocator<Red::IScriptable> s_IScriptableType;
 }
 
@@ -26,7 +30,7 @@ void* App::ObjectRegistry::OnCreateHandle(Red::Handle<Red::ISerializable>& aHand
         std::unique_lock lock(s_registryLock);
         s_objects.emplace_back(aHandle);
 
-        if (s_objects.size() >= MaxNumObjects - 1)
+        if (s_objects.size() >= s_shrinkThreshold)
         {
             Shrink();
         }
@@ -150,6 +154,14 @@ void App::ObjectRegistry::RestoreSnapshot()
 
 void App::ObjectRegistry::Shrink()
 {
+    const auto before = s_objects.size();
     auto [b, e] = std::ranges::remove_if(s_objects, [](auto& x) { return x.Expired(); });
     s_objects.erase(b, e);
+
+    const auto threshold = std::max<size_t>(MaxNumObjects - 1, s_objects.size() * 2);
+    if (threshold != s_shrinkThreshold)
+    {
+        LogInfo("ObjectRegistry: {} of {} objects alive, next shrink at {}.", s_objects.size(), before, threshold);
+        s_shrinkThreshold = threshold;
+    }
 }

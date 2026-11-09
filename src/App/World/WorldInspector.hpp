@@ -83,7 +83,14 @@ class WorldInspector
     , public Core::HookingAgent
 {
 public:
-    static constexpr auto FrustumUpdateFreq = 1.0f / 30;
+    static constexpr auto StreamedNodesUpdateFreq = 1.0f / 30.0f;
+    static constexpr auto FrustumUpdateFreq = 1.0f / 30.0f;
+    static constexpr auto FrustumUpdateFreqMedium = 1.0f / 15.0f;
+    static constexpr auto FrustumUpdateFreqLarge = 1.0f / 8.0f;
+    static constexpr auto FrustumUpdateFreqHuge = 1.0f / 4.0f;
+    static constexpr size_t FrustumMediumNodeCount = 20000;
+    static constexpr size_t FrustumLargeNodeCount = 60000;
+    static constexpr size_t FrustumHugeNodeCount = 100000;
     static constexpr auto FrustumMinDistance = 120.0f;
     static constexpr auto FrustumMaxDistance = 999.0f;
     static constexpr auto TargetingMinDistance = 2.0f;
@@ -97,6 +104,8 @@ public:
     void SetTargetingDistance(float aDistance);
     [[nodiscard]] bool IsDiscoverMode() const;
     void SetDiscoverMode(bool aEnabled);
+    [[nodiscard]] bool GetFrustumUpdatesEnabled() const;
+    void SetFrustumUpdatesEnabled(bool aEnabled);
 
     WorldNodeInstanceStaticData ResolveSectorDataFromNodeID(uint64_t aNodeID);
     WorldNodeInstanceStaticData ResolveSectorDataFromNodeInstance(const Red::WeakHandle<Red::worldINodeInstance>& aNodeInstance);
@@ -152,6 +161,7 @@ private:
 
     void UpdateStreamedNodes();
     void UpdateFrustumNodes();
+    [[nodiscard]] float GetAdaptiveFrustumUpdateFreq();
 
     bool UpdateNodeVisibility(const Red::Handle<Red::worldINodeInstance>& aNodeInstance, bool aToggle, bool aVisible);
     template<typename TRenderProxy>
@@ -181,8 +191,11 @@ private:
 
     bool m_ready{false};
     bool m_discoverMode{false};
-    float m_nodesUpdateDelay{0.0};
-    volatile bool m_nodesUpdating{false};
+    float m_nodesUpdateDelay{0.0f};
+    float m_frustumUpdateDelay{0.0f};
+    std::atomic_bool m_nodesUpdating{false};
+    std::atomic_bool m_frustumUpdatesEnabled{false};
+    std::atomic_bool m_forceFrustumRefresh{false};
     float m_frustumDistance{FrustumMinDistance};
     float m_targetingDistance{FrustumMinDistance};
 
@@ -253,6 +266,8 @@ RTTI_DEFINE_CLASS(App::WorldInspector, {
     RTTI_METHOD(SetTargetingDistance);
     RTTI_METHOD(IsDiscoverMode);
     RTTI_METHOD(SetDiscoverMode);
+    RTTI_METHOD(GetFrustumUpdatesEnabled);
+    RTTI_METHOD(SetFrustumUpdatesEnabled);
 
     RTTI_METHOD(ResolveSectorDataFromNodeID);
     RTTI_METHOD(ResolveSectorDataFromNodeInstance);

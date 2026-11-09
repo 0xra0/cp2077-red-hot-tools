@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <concepts>
 #include <cstdint>
 #include <filesystem>
@@ -10,6 +11,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <shared_mutex>
 #include <source_location>
 #include <string>
 #include <string_view>

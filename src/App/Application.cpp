@@ -30,7 +30,13 @@ App::Application::Application(HMODULE aHandle, const RED4ext::v1::Sdk* aSdk)
 
     Register<App::ArchiveLoader>();
     Register<App::ArchiveWatcher>(Env::ArchiveHotDir());
+
+#if defined(RHT_ENABLE_RESOURCE_LOGGER)
+    // ResourceLogger installs hooks on ResourceDepot::RequestResource and
+    // ResourceReference::EnsureLoaded. These are extremely hot paths in a
+    // heavily modded game, so diagnostics are opt-in instead of always-on.
     Register<App::ResourceLogger>();
+#endif
 
     Register<App::ScriptLoader>(Env::ScriptSourceDir(), Env::ScriptBlobPath());
     Register<App::ScriptWatcher>(Env::ScriptHotFile());

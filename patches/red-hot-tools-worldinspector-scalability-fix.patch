@@ -1,0 +1,324 @@
+diff --git a/src/App/World/WorldInspector.cpp b/src/App/World/WorldInspector.cpp
+index 62ec9ce..fab2cf2 100644
+--- a/src/App/World/WorldInspector.cpp
++++ b/src/App/World/WorldInspector.cpp
+@@ -22,12 +22,15 @@ void App::WorldInspector::OnWorldAttached(Red::world::RuntimeScene*)
+ 
+     m_cameraSystem = Red::GetGameSystem<Red::gameICameraSystem>();
+ 
+-    m_nodesUpdateDelay = 0;
++    m_nodesUpdateDelay = 0.0f;
++    m_frustumUpdateDelay = 0.0f;
+ }
+ 
+ void App::WorldInspector::OnAfterWorldDetach()
+ {
+     m_ready = false;
++    m_frustumUpdatesEnabled.store(false, std::memory_order_release);
++    m_forceFrustumRefresh.store(false, std::memory_order_release);
+ 
+     m_nodeRegistry->UnregisterWatcher(this);
+     m_nodeRegistry->ClearRuntimeData();
+@@ -54,25 +57,66 @@ void App::WorldInspector::OnRegisterUpdates(Red::UpdateRegistrar* aRegistrar)
+     aRegistrar->RegisterUpdate(Red::UpdateTickGroup::FrameBegin, this, "WorldInspector/UpdateNodes",
+                                [this](Red::FrameInfo& aFrame, Red::JobQueue&)
+                                {
+-                                   if (m_ready && !m_nodesUpdating)
+-                                   {
+-                                       m_nodesUpdateDelay -= aFrame.deltaTime;
+-                                       if (m_nodesUpdateDelay <= 0)
+-                                       {
+-                                           m_nodesUpdating = true;
+-                                           m_nodesUpdateDelay = FrustumUpdateFreq;
++                                   if (!m_ready || m_nodesUpdating.load(std::memory_order_acquire))
++                                       return;
++
++                                   m_nodesUpdateDelay -= aFrame.deltaTime;
++                                   m_frustumUpdateDelay -= aFrame.deltaTime;
++
++                                   if (m_forceFrustumRefresh.exchange(false, std::memory_order_acq_rel))
++                                       m_frustumUpdateDelay = 0.0f;
++
++                                   const bool updateStreamedNodes = m_nodesUpdateDelay <= 0.0f;
++                                   const bool updateFrustumNodes =
++                                       m_frustumUpdatesEnabled.load(std::memory_order_acquire) &&
++                                       m_frustumUpdateDelay <= 0.0f;
++
++                                   if (!updateStreamedNodes && !updateFrustumNodes)
++                                       return;
+ 
+-                                           Red::JobQueue().Dispatch([this] {
+-                                               UpdateStreamedNodes();
+-                                               UpdateFrustumNodes();
++                                   bool expected = false;
++                                   if (!m_nodesUpdating.compare_exchange_strong(expected, true,
++                                                                                std::memory_order_acq_rel))
++                                       return;
+ 
+-                                               m_nodesUpdating = false;
+-                                           });
++                                   if (updateStreamedNodes)
++                                       m_nodesUpdateDelay = StreamedNodesUpdateFreq;
++
++                                   if (updateFrustumNodes)
++                                       m_frustumUpdateDelay = GetAdaptiveFrustumUpdateFreq();
++
++                                   Red::JobQueue().Dispatch([this, updateStreamedNodes, updateFrustumNodes] {
++                                       if (updateStreamedNodes)
++                                           UpdateStreamedNodes();
++
++                                       if (updateFrustumNodes &&
++                                           m_frustumUpdatesEnabled.load(std::memory_order_acquire))
++                                       {
++                                           UpdateFrustumNodes();
+                                        }
+-                                   }
++
++                                       m_nodesUpdating.store(false, std::memory_order_release);
++                                   });
+                                });
+ }
+ 
++float App::WorldInspector::GetAdaptiveFrustumUpdateFreq()
++{
++    std::shared_lock _(m_streamedNodesLock);
++    const auto nodeCount = m_streamedNodes.size();
++
++    if (nodeCount >= FrustumHugeNodeCount)
++        return FrustumUpdateFreqHuge;
++
++    if (nodeCount >= FrustumLargeNodeCount)
++        return FrustumUpdateFreqLarge;
++
++    if (nodeCount >= FrustumMediumNodeCount)
++        return FrustumUpdateFreqMedium;
++
++    return FrustumUpdateFreq;
++}
++
+ void App::WorldInspector::OnNodeStreamedIn(uint64_t aNodeHash,
+                                              Red::worldNode* aNodeDefinition,
+                                              Red::worldINodeInstance* aNodeInstance,
+@@ -538,6 +582,9 @@ void App::WorldInspector::UpdateStreamedNodes()
+ 
+ void App::WorldInspector::UpdateFrustumNodes()
+ {
++    if (!m_frustumUpdatesEnabled.load(std::memory_order_acquire))
++        return;
++
+ #ifndef NDEBUG
+     std::chrono::duration<double, std::milli> initDuration{};
+     std::chrono::duration<double, std::milli> commitDuration{};
+@@ -574,9 +621,16 @@ void App::WorldInspector::UpdateFrustumNodes()
+         std::shared_lock _(m_streamedNodesLock);
+ 
+         Core::Vector<int32_t> frustumActorIndexes;
++        size_t scannedNodeCount = 0;
+ 
+         for (const auto& [hash, streamedNode] : m_streamedNodes)
+         {
++            // Closing/disabling the inspector should stop an already-running large scan quickly.
++            if ((++scannedNodeCount & 0x3FFu) == 0 &&
++                !m_frustumUpdatesEnabled.load(std::memory_order_acquire))
++            {
++                return;
++            }
+             if (streamedNode.nodeInstance.Expired() || streamedNode.nodeDefinition.Expired())
+                 continue;
+ 
+@@ -741,6 +795,9 @@ void App::WorldInspector::UpdateFrustumNodes()
+     const auto commitStart = std::chrono::steady_clock::now();
+ #endif
+ 
++    if (!m_frustumUpdatesEnabled.load(std::memory_order_acquire))
++        return;
++
+     std::sort(targetedNodeIndexes.begin(), targetedNodeIndexes.end(),
+               [&frustumNodes](uint32_t a, uint32_t b)
+               {
+@@ -820,6 +877,32 @@ void App::WorldInspector::SetDiscoverMode(bool aEnabled)
+     m_discoverMode = aEnabled;
+ }
+ 
++bool App::WorldInspector::GetFrustumUpdatesEnabled() const
++{
++    return m_frustumUpdatesEnabled.load(std::memory_order_acquire);
++}
++
++void App::WorldInspector::SetFrustumUpdatesEnabled(bool aEnabled)
++{
++    const auto wasEnabled = m_frustumUpdatesEnabled.exchange(aEnabled, std::memory_order_acq_rel);
++
++    if (aEnabled == wasEnabled)
++        return;
++
++    if (aEnabled)
++    {
++        // The setter can be called from scripting while the frame update runs elsewhere.
++        // Signal the frame thread instead of racing on m_frustumUpdateDelay directly.
++        m_forceFrustumRefresh.store(true, std::memory_order_release);
++        return;
++    }
++
++    // Do not keep stale results/handles alive while the inspector is inactive.
++    std::unique_lock _(m_frustumNodesLock);
++    m_frustumNodes.Clear();
++    m_targetedNodes.Clear();
++}
++
+ App::WorldNodeInstanceStaticData App::WorldInspector::ResolveSectorDataFromNodeID(uint64_t aNodeID)
+ {
+     if (!m_ready)
+diff --git a/src/App/World/WorldInspector.hpp b/src/App/World/WorldInspector.hpp
+index c335b26..15a94dc 100644
+--- a/src/App/World/WorldInspector.hpp
++++ b/src/App/World/WorldInspector.hpp
+@@ -83,7 +83,14 @@ class WorldInspector
+     , public Core::HookingAgent
+ {
+ public:
+-    static constexpr auto FrustumUpdateFreq = 1.0f / 30;
++    static constexpr auto StreamedNodesUpdateFreq = 1.0f / 30.0f;
++    static constexpr auto FrustumUpdateFreq = 1.0f / 30.0f;
++    static constexpr auto FrustumUpdateFreqMedium = 1.0f / 15.0f;
++    static constexpr auto FrustumUpdateFreqLarge = 1.0f / 8.0f;
++    static constexpr auto FrustumUpdateFreqHuge = 1.0f / 4.0f;
++    static constexpr size_t FrustumMediumNodeCount = 20000;
++    static constexpr size_t FrustumLargeNodeCount = 60000;
++    static constexpr size_t FrustumHugeNodeCount = 100000;
+     static constexpr auto FrustumMinDistance = 120.0f;
+     static constexpr auto FrustumMaxDistance = 999.0f;
+     static constexpr auto TargetingMinDistance = 2.0f;
+@@ -97,6 +104,8 @@ public:
+     void SetTargetingDistance(float aDistance);
+     [[nodiscard]] bool IsDiscoverMode() const;
+     void SetDiscoverMode(bool aEnabled);
++    [[nodiscard]] bool GetFrustumUpdatesEnabled() const;
++    void SetFrustumUpdatesEnabled(bool aEnabled);
+ 
+     WorldNodeInstanceStaticData ResolveSectorDataFromNodeID(uint64_t aNodeID);
+     WorldNodeInstanceStaticData ResolveSectorDataFromNodeInstance(const Red::WeakHandle<Red::worldINodeInstance>& aNodeInstance);
+@@ -152,6 +161,7 @@ private:
+ 
+     void UpdateStreamedNodes();
+     void UpdateFrustumNodes();
++    [[nodiscard]] float GetAdaptiveFrustumUpdateFreq();
+ 
+     bool UpdateNodeVisibility(const Red::Handle<Red::worldINodeInstance>& aNodeInstance, bool aToggle, bool aVisible);
+     template<typename TRenderProxy>
+@@ -181,8 +191,11 @@ private:
+ 
+     bool m_ready{false};
+     bool m_discoverMode{false};
+-    float m_nodesUpdateDelay{0.0};
+-    volatile bool m_nodesUpdating{false};
++    float m_nodesUpdateDelay{0.0f};
++    float m_frustumUpdateDelay{0.0f};
++    std::atomic_bool m_nodesUpdating{false};
++    std::atomic_bool m_frustumUpdatesEnabled{false};
++    std::atomic_bool m_forceFrustumRefresh{false};
+     float m_frustumDistance{FrustumMinDistance};
+     float m_targetingDistance{FrustumMinDistance};
+ 
+@@ -253,6 +266,8 @@ RTTI_DEFINE_CLASS(App::WorldInspector, {
+     RTTI_METHOD(SetTargetingDistance);
+     RTTI_METHOD(IsDiscoverMode);
+     RTTI_METHOD(SetDiscoverMode);
++    RTTI_METHOD(GetFrustumUpdatesEnabled);
++    RTTI_METHOD(SetFrustumUpdatesEnabled);
+ 
+     RTTI_METHOD(ResolveSectorDataFromNodeID);
+     RTTI_METHOD(ResolveSectorDataFromNodeInstance);
+diff --git a/src/pch.hpp b/src/pch.hpp
+index 10ac32c..72519d1 100644
+--- a/src/pch.hpp
++++ b/src/pch.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <concepts>
+ #include <cstdint>
+ #include <filesystem>
+@@ -10,6 +11,7 @@
+ #include <map>
+ #include <memory>
+ #include <set>
++#include <shared_mutex>
+ #include <source_location>
+ #include <string>
+ #include <string_view>
+diff --git a/support/cet/modules/world/main.lua b/support/cet/modules/world/main.lua
+index 2b971a8..e896c98 100644
+--- a/support/cet/modules/world/main.lua
++++ b/support/cet/modules/world/main.lua
+@@ -28,12 +28,19 @@ local spatialQuerySystem
+ local transactionSystem
+ local inspectionSystem
+ 
++local function setFrustumUpdatesEnabled(enabled)
++    if inspectionSystem then
++        inspectionSystem:SetFrustumUpdatesEnabled(enabled)
++    end
++end
++
+ local function initializeSystems()
+     cameraSystem = Game.GetCameraSystem()
+     targetingSystem = Game.GetTargetingSystem()
+     spatialQuerySystem = Game.GetSpatialQueriesSystem()
+     transactionSystem = Game.GetTransactionSystem()
+     inspectionSystem = Game.GetWorldInspector()
++    inspectionSystem:SetFrustumUpdatesEnabled(false)
+ end
+ 
+ -- User State --
+@@ -3691,6 +3698,19 @@ local function setActive(active)
+     saveUserState()
+ end
+ 
++local function updateFrustumActivity()
++    local visible = userState.isModuleActive and
++        ((viewState.isConsoleOpen and viewState.isWindowExpanded) or userState.isOnScreenDisplayActive)
++
++    local needed = false
++    if visible then
++        needed = userState.selectedTab == MainTab.Scan or
++            (userState.selectedTab == MainTab.Inspect and userState.targetingMode == TargetingMode.StaticBounds)
++    end
++
++    setFrustumUpdatesEnabled(needed)
++end
++
+ local function onInit()
+     initializeSystems()
+     initializeUserState()
+@@ -3700,6 +3720,8 @@ local function onInit()
+     initializeViewData()
+ 
+     Cron.Every(1 / 60, function()
++        updateFrustumActivity()
++
+         if userState.isModuleActive then
+             if viewState.isConsoleOpen then
+                 if viewState.isWindowExpanded then
+@@ -3726,6 +3748,7 @@ local function onInit()
+ end
+ 
+ local function onShutdown()
++    setFrustumUpdatesEnabled(false)
+     disableHighlights()
+     saveUserState()
+ end
+diff --git a/xmake.lua b/xmake.lua
+index a846dd2..5c3ae62 100644
+--- a/xmake.lua
++++ b/xmake.lua
+@@ -12,6 +12,7 @@ if is_mode("debug") then
+     set_optimize("none")
+     add_cxxflags("/Od /Ob0 /Zi /RTC1")
+ elseif is_mode("release") then
++    add_defines("NDEBUG")
+     set_symbols("hidden")
+     set_strip("all")
+     set_optimize("fastest")

@@ -28,12 +28,19 @@ local spatialQuerySystem
 local transactionSystem
 local inspectionSystem
 
+local function setFrustumUpdatesEnabled(enabled)
+    if inspectionSystem then
+        inspectionSystem:SetFrustumUpdatesEnabled(enabled)
+    end
+end
+
 local function initializeSystems()
     cameraSystem = Game.GetCameraSystem()
     targetingSystem = Game.GetTargetingSystem()
     spatialQuerySystem = Game.GetSpatialQueriesSystem()
     transactionSystem = Game.GetTransactionSystem()
     inspectionSystem = Game.GetWorldInspector()
+    inspectionSystem:SetFrustumUpdatesEnabled(false)
 end
 
 -- User State --
@@ -3691,6 +3698,19 @@ local function setActive(active)
     saveUserState()
 end
 
+local function updateFrustumActivity()
+    local visible = userState.isModuleActive and
+        ((viewState.isConsoleOpen and viewState.isWindowExpanded) or userState.isOnScreenDisplayActive)
+
+    local needed = false
+    if visible then
+        needed = userState.selectedTab == MainTab.Scan or
+            (userState.selectedTab == MainTab.Inspect and userState.targetingMode == TargetingMode.StaticBounds)
+    end
+
+    setFrustumUpdatesEnabled(needed)
+end
+
 local function onInit()
     initializeSystems()
     initializeUserState()
@@ -3700,6 +3720,8 @@ local function onInit()
     initializeViewData()
 
     Cron.Every(1 / 60, function()
+        updateFrustumActivity()
+
         if userState.isModuleActive then
             if viewState.isConsoleOpen then
                 if viewState.isWindowExpanded then
@@ -3726,6 +3748,7 @@ local function onInit()
 end
 
 local function onShutdown()
+    setFrustumUpdatesEnabled(false)
     disableHighlights()
     saveUserState()
 end

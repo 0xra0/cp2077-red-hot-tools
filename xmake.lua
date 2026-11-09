@@ -12,6 +12,7 @@ if is_mode("debug") then
     set_optimize("none")
     add_cxxflags("/Od /Ob0 /Zi /RTC1")
 elseif is_mode("release") then
+    add_defines("NDEBUG")
     set_symbols("hidden")
     set_strip("all")
     set_optimize("fastest")
@@ -30,6 +31,14 @@ else
 end
 
 add_requires("fmt", "hopscotch-map", "minhook", "spdlog", "tiltedcore")
+-- mimalloc 3.x drops mi_malloc_size from its Windows lib; TiltedCore still calls it.
+add_requireconfs("tiltedcore.mimalloc", {version = "2.x", override = true})
+
+option("resource_logger")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Enable expensive missing/unloaded resource diagnostics")
+option_end()
 
 target("RedHotTools")
     set_default(true)
@@ -43,6 +52,9 @@ target("RedHotTools")
     add_packages("fmt", "hopscotch-map", "minhook", "spdlog", "tiltedcore")
     add_syslinks("Version", "User32")
     add_defines("WINVER=0x0601", "WIN32_LEAN_AND_MEAN", "NOMINMAX", "_DISABLE_EXTENDED_ALIGNED_STORAGE")
+    if has_config("resource_logger") then
+        add_defines("RHT_ENABLE_RESOURCE_LOGGER")
+    end
     set_configdir(".")
     add_configfiles("config/Project.hpp.in", {prefixdir = "src/App"})
     add_configfiles("config/Version.rc.in", {prefixdir = "src/App"})

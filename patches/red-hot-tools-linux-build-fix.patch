@@ -1,0 +1,14 @@
+diff --git a/src/Red/Addresses/Library.hpp b/src/Red/Addresses/Library.hpp
+index d3c6f70..2ef5c93 100644
+--- a/src/Red/Addresses/Library.hpp
++++ b/src/Red/Addresses/Library.hpp
+@@ -2,6 +2,9 @@
+ 
+ namespace Red::AddressLib
+ {
++constexpr uint32_t EngineConfig_GetInstance = 3182170505;
++constexpr uint32_t EngineConfigStore_GetVar = 3758823966;
++
+ constexpr uint32_t Main = 240386859;
+ constexpr uint32_t ExecuteProcess = 2203918127; // CProcessRunner::Run
+ constexpr uint32_t InvokeSCC = 2746819158;

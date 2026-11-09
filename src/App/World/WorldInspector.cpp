@@ -22,12 +22,15 @@ void App::WorldInspector::OnWorldAttached(Red::world::RuntimeScene*)
 
     m_cameraSystem = Red::GetGameSystem<Red::gameICameraSystem>();
 
-    m_nodesUpdateDelay = 0;
+    m_nodesUpdateDelay = 0.0f;
+    m_frustumUpdateDelay = 0.0f;
 }
 
 void App::WorldInspector::OnAfterWorldDetach()
 {
     m_ready = false;
+    m_frustumUpdatesEnabled.store(false, std::memory_order_release);
+    m_forceFrustumRefresh.store(false, std::memory_order_release);
 
     m_nodeRegistry->UnregisterWatcher(this);
     m_nodeRegistry->ClearRuntimeData();
@@ -54,23 +57,64 @@ void App::WorldInspector::OnRegisterUpdates(Red::UpdateRegistrar* aRegistrar)
     aRegistrar->RegisterUpdate(Red::UpdateTickGroup::FrameBegin, this, "WorldInspector/UpdateNodes",
                                [this](Red::FrameInfo& aFrame, Red::JobQueue&)
                                {
-                                   if (m_ready && !m_nodesUpdating)
-                                   {
-                                       m_nodesUpdateDelay -= aFrame.deltaTime;
-                                       if (m_nodesUpdateDelay <= 0)
+                                   if (!m_ready || m_nodesUpdating.load(std::memory_order_acquire))
+                                       return;
+
+                                   m_nodesUpdateDelay -= aFrame.deltaTime;
+                                   m_frustumUpdateDelay -= aFrame.deltaTime;
+
+                                   if (m_forceFrustumRefresh.exchange(false, std::memory_order_acq_rel))
+                                       m_frustumUpdateDelay = 0.0f;
+
+                                   const bool updateStreamedNodes = m_nodesUpdateDelay <= 0.0f;
+                                   const bool updateFrustumNodes =
+                                       m_frustumUpdatesEnabled.load(std::memory_order_acquire) &&
+                                       m_frustumUpdateDelay <= 0.0f;
+
+                                   if (!updateStreamedNodes && !updateFrustumNodes)
+                                       return;
+
+                                   bool expected = false;
+                                   if (!m_nodesUpdating.compare_exchange_strong(expected, true,
+                                                                                std::memory_order_acq_rel))
+                                       return;
+
+                                   if (updateStreamedNodes)
+                                       m_nodesUpdateDelay = StreamedNodesUpdateFreq;
+
+                                   if (updateFrustumNodes)
+                                       m_frustumUpdateDelay = GetAdaptiveFrustumUpdateFreq();
+
+                                   Red::JobQueue().Dispatch([this, updateStreamedNodes, updateFrustumNodes] {
+                                       if (updateStreamedNodes)
+                                           UpdateStreamedNodes();
+
+                                       if (updateFrustumNodes &&
+                                           m_frustumUpdatesEnabled.load(std::memory_order_acquire))
                                        {
-                                           m_nodesUpdating = true;
-                                           m_nodesUpdateDelay = FrustumUpdateFreq;
-
-                                           Red::JobQueue().Dispatch([this] {
-                                               UpdateStreamedNodes();
-                                               UpdateFrustumNodes();
-
-                                               m_nodesUpdating = false;
-                                           });
+                                           UpdateFrustumNodes();
                                        }
-                                   }
+
+                                       m_nodesUpdating.store(false, std::memory_order_release);
+                                   });
                                });
+}
+
+float App::WorldInspector::GetAdaptiveFrustumUpdateFreq()
+{
+    std::shared_lock _(m_streamedNodesLock);
+    const auto nodeCount = m_streamedNodes.size();
+
+    if (nodeCount >= FrustumHugeNodeCount)
+        return FrustumUpdateFreqHuge;
+
+    if (nodeCount >= FrustumLargeNodeCount)
+        return FrustumUpdateFreqLarge;
+
+    if (nodeCount >= FrustumMediumNodeCount)
+        return FrustumUpdateFreqMedium;
+
+    return FrustumUpdateFreq;
 }
 
 void App::WorldInspector::OnNodeStreamedIn(uint64_t aNodeHash,
@@ -538,6 +582,9 @@ void App::WorldInspector::UpdateStreamedNodes()
 
 void App::WorldInspector::UpdateFrustumNodes()
 {
+    if (!m_frustumUpdatesEnabled.load(std::memory_order_acquire))
+        return;
+
 #ifndef NDEBUG
     std::chrono::duration<double, std::milli> initDuration{};
     std::chrono::duration<double, std::milli> commitDuration{};
@@ -574,9 +621,16 @@ void App::WorldInspector::UpdateFrustumNodes()
         std::shared_lock _(m_streamedNodesLock);
 
         Core::Vector<int32_t> frustumActorIndexes;
+        size_t scannedNodeCount = 0;
 
         for (const auto& [hash, streamedNode] : m_streamedNodes)
         {
+            // Closing/disabling the inspector should stop an already-running large scan quickly.
+            if ((++scannedNodeCount & 0x3FFu) == 0 &&
+                !m_frustumUpdatesEnabled.load(std::memory_order_acquire))
+            {
+                return;
+            }
             if (streamedNode.nodeInstance.Expired() || streamedNode.nodeDefinition.Expired())
                 continue;
 
@@ -741,6 +795,9 @@ void App::WorldInspector::UpdateFrustumNodes()
     const auto commitStart = std::chrono::steady_clock::now();
 #endif
 
+    if (!m_frustumUpdatesEnabled.load(std::memory_order_acquire))
+        return;
+
     std::sort(targetedNodeIndexes.begin(), targetedNodeIndexes.end(),
               [&frustumNodes](uint32_t a, uint32_t b)
               {
@@ -818,6 +875,32 @@ bool App::WorldInspector::IsDiscoverMode() const
 void App::WorldInspector::SetDiscoverMode(bool aEnabled)
 {
     m_discoverMode = aEnabled;
+}
+
+bool App::WorldInspector::GetFrustumUpdatesEnabled() const
+{
+    return m_frustumUpdatesEnabled.load(std::memory_order_acquire);
+}
+
+void App::WorldInspector::SetFrustumUpdatesEnabled(bool aEnabled)
+{
+    const auto wasEnabled = m_frustumUpdatesEnabled.exchange(aEnabled, std::memory_order_acq_rel);
+
+    if (aEnabled == wasEnabled)
+        return;
+
+    if (aEnabled)
+    {
+        // The setter can be called from scripting while the frame update runs elsewhere.
+        // Signal the frame thread instead of racing on m_frustumUpdateDelay directly.
+        m_forceFrustumRefresh.store(true, std::memory_order_release);
+        return;
+    }
+
+    // Do not keep stale results/handles alive while the inspector is inactive.
+    std::unique_lock _(m_frustumNodesLock);
+    m_frustumNodes.Clear();
+    m_targetedNodes.Clear();
 }
 
 App::WorldNodeInstanceStaticData App::WorldInspector::ResolveSectorDataFromNodeID(uint64_t aNodeID)
